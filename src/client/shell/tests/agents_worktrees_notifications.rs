@@ -1017,6 +1017,108 @@ fn agent_sort_toggle_is_client_local_and_persists_per_endpoint() {
 }
 
 #[test]
+fn agent_groups_collapse_per_workspace_and_persist() {
+    let path = std::env::temp_dir().join(format!(
+        "herdr-shell-agent-groups-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos()
+    ));
+    let mut projected = snapshot();
+    let mut second = projected.workspaces[0].clone();
+    second.workspace_id = "ws_2".into();
+    second.number = 2;
+    second.label = "second".into();
+    second.focused = false;
+    projected.workspaces.push(second);
+    let agent = |pane_id: &str, workspace_id: &str, status| ClientShellAgent {
+        pane_id: pane_id.into(),
+        workspace_id: workspace_id.into(),
+        tab_id: "tab_1".into(),
+        name: Some(pane_id.into()),
+        display_agent: None,
+        agent: Some("pi".into()),
+        title: None,
+        terminal_title: None,
+        terminal_title_stripped: None,
+        agent_status: status,
+        state_change_seq: 1,
+        state_labels: Vec::new(),
+        tokens: Vec::new(),
+        focused: false,
+    };
+    projected.agents = vec![
+        agent("pane_1", "ws_1", AgentStatus::Idle),
+        agent("pane_2", "ws_2", AgentStatus::Blocked),
+        agent("pane_3", "ws_1", AgentStatus::Working),
+    ];
+    let config =
+        ClientShellConfig::from_config(&Config::default()).with_preferences_path(path.clone());
+    let mut state = ClientShellState::new(config);
+    state.set_snapshot(Box::new(projected.clone()));
+    state.set_pane_surface(surface());
+
+    let items = super::super::agent_sidebar::agent_panel_items(
+        &projected,
+        &state.config,
+        &state.collapsed_agent_groups,
+    );
+    let summary = items
+        .iter()
+        .map(|item| match item {
+            super::super::agent_sidebar::AgentPanelItem::Group(group) => {
+                format!("{}:{:?}:{}", group.workspace_id, group.status, group.count)
+            }
+            super::super::agent_sidebar::AgentPanelItem::Agent(row) => row.pane_id.clone(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        summary,
+        [
+            "ws_1:Working:2",
+            "pane_1",
+            "pane_3",
+            "ws_2:Blocked:1",
+            "pane_2"
+        ]
+    );
+
+    state.compose(106, 30).expect("grouped agent sidebar");
+    let (toggle, _) = state
+        .hits
+        .agent_group_toggles
+        .iter()
+        .find(|(_, workspace_id)| workspace_id == "ws_1")
+        .cloned()
+        .expect("ws_1 group header");
+    let click = state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: toggle.x + 2,
+        row: toggle.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    assert!(click.actions.is_empty());
+    state.compose(106, 30).expect("collapsed agent sidebar");
+    assert_eq!(
+        state
+            .hits
+            .agents
+            .iter()
+            .map(|(_, pane_id)| pane_id.as_str())
+            .collect::<Vec<_>>(),
+        ["pane_2"]
+    );
+
+    let reloaded = ClientShellState::new(
+        ClientShellConfig::from_config(&Config::default()).with_preferences_path(path.clone()),
+    );
+    assert!(reloaded.collapsed_agent_groups.contains("ws_1"));
+    std::fs::remove_file(path).expect("remove agent group preferences");
+}
+
+#[test]
 fn workspace_actions_preserve_selected_target_and_client_confirmation() {
     let mut snapshot = snapshot();
     let mut second = snapshot.workspaces[0].clone();
@@ -1681,4 +1783,40 @@ fn semantic_notifications_use_client_policy_and_stable_navigation_targets() {
     assert!(repaint);
     assert!(state.visible_notification.is_none());
     assert_eq!(state.pending_notifications.len(), 1);
+}
+
+#[test]
+fn workspaces_get_distinct_stable_auto_colors() {
+    let mut projected = snapshot();
+    let template = projected.workspaces[0].clone();
+    projected.workspaces = (0..8)
+        .map(|index| {
+            let mut workspace = template.clone();
+            workspace.workspace_id = format!("ws_{index}");
+            workspace.label = format!("run-{index}");
+            workspace
+        })
+        .collect();
+    let config = ClientShellConfig::from_config(&Config::default());
+    let color = |snapshot: &ClientShellSnapshot, index: usize| {
+        super::super::sidebar::workspace_rows(
+            snapshot,
+            &snapshot.workspaces[index],
+            AgentStatus::Idle,
+            false,
+            &config.spaces,
+        )
+        .into_iter()
+        .flatten()
+        .find(|token| matches!(token.kind, crate::ui::ResolvedTokenKind::Workspace(_)))
+        .and_then(|token| token.style.fg)
+        .expect("workspace auto color")
+    };
+    let colors = (0..8)
+        .map(|index| color(&projected, index))
+        .collect::<Vec<_>>();
+    for (index, current) in colors.iter().enumerate() {
+        assert!(!colors[..index].contains(current), "color {index} repeats");
+    }
+    assert_eq!(color(&projected, 3), color(&projected.clone(), 3));
 }

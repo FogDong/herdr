@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Paragraph, Widget},
 };
 
@@ -12,9 +12,23 @@ use super::*;
 
 pub(super) struct AgentRow {
     pub(super) pane_id: String,
+    pub(super) workspace_id: String,
     pub(super) status: crate::api::schema::AgentStatus,
     pub(super) focused: bool,
     pub(super) rows: Vec<Vec<crate::ui::ResolvedToken>>,
+    pub(super) group_color: Option<crate::config::SidebarTokenColor>,
+}
+
+pub(super) struct AgentGroupRow {
+    pub(super) workspace_id: String,
+    pub(super) status: crate::api::schema::AgentStatus,
+    pub(super) count: usize,
+    pub(super) collapsed: bool,
+}
+
+pub(super) enum AgentPanelItem {
+    Group(AgentGroupRow),
+    Agent(AgentRow),
 }
 
 pub(super) fn ordered_agent_pane_ids(
@@ -54,6 +68,7 @@ pub(super) fn render_agent_panel(
     area: Rect,
     snapshot: &ClientShellSnapshot,
     config: &ClientShellConfig,
+    collapsed_agent_groups: &HashSet<String>,
     agent_scroll: &mut usize,
     hits: &mut ShellHitMap,
 ) {
@@ -67,11 +82,16 @@ pub(super) fn render_agent_panel(
         return;
     }
 
-    let rows = agent_rows(snapshot, config, None);
+    let items = agent_panel_items(snapshot, config, collapsed_agent_groups);
+    let nested = u16::from(
+        items
+            .iter()
+            .any(|item| matches!(item, AgentPanelItem::Group(_))),
+    ) * 2;
     render_agent_list(
         buffer,
         area,
-        &rows,
+        &items,
         snapshot
             .agent_view_label
             .as_ref()
@@ -79,12 +99,138 @@ pub(super) fn render_agent_panel(
         config,
         agent_scroll,
         hits,
-        |row| row.rows.len(),
-        |buffer, rect, row, hits| {
-            hits.agents.push((rect, row.pane_id.clone()));
-            render_agent_row(buffer, rect, row, config);
+        |item| match item {
+            AgentPanelItem::Group(_) => 1,
+            AgentPanelItem::Agent(row) => row.rows.len(),
+        },
+        |buffer, rect, item, hits| match item {
+            AgentPanelItem::Group(group) => {
+                hits.agent_group_toggles
+                    .push((rect, group.workspace_id.clone()));
+                render_agent_group_row(buffer, rect, group, snapshot, config);
+            }
+            AgentPanelItem::Agent(row) => {
+                hits.agents.push((rect, row.pane_id.clone()));
+                render_agent_row(buffer, rect, row, config, nested);
+            }
         },
     );
+}
+
+/// Groups agents under a collapsible header per workspace; only the grouped
+/// (spaces) ordering has a stable workspace order to group by.
+pub(super) fn agent_panel_items(
+    snapshot: &ClientShellSnapshot,
+    config: &ClientShellConfig,
+    collapsed_agent_groups: &HashSet<String>,
+) -> Vec<AgentPanelItem> {
+    let rows = agent_rows(snapshot, config, None);
+    if snapshot.agent_view_label.is_some()
+        || config.agent_panel_sort != crate::config::AgentPanelSortConfig::Spaces
+    {
+        return rows.into_iter().map(AgentPanelItem::Agent).collect();
+    }
+    let mut groups = Vec::<(String, Vec<AgentRow>)>::new();
+    for row in rows {
+        match groups.iter_mut().find(|(id, _)| *id == row.workspace_id) {
+            Some((_, members)) => members.push(row),
+            None => groups.push((row.workspace_id.clone(), vec![row])),
+        }
+    }
+    let mut items = Vec::new();
+    for (workspace_id, members) in groups {
+        let collapsed = collapsed_agent_groups.contains(&workspace_id);
+        let status = members
+            .iter()
+            .map(|row| row.status)
+            .max_by_key(|status| status_priority(*status))
+            .unwrap_or(crate::api::schema::AgentStatus::Unknown);
+        let color = workspace_color(snapshot, config, &workspace_id, status);
+        items.push(AgentPanelItem::Group(AgentGroupRow {
+            status,
+            count: members.len(),
+            collapsed,
+            workspace_id,
+        }));
+        if !collapsed {
+            items.extend(members.into_iter().map(|mut row| {
+                row.group_color = color;
+                AgentPanelItem::Agent(row)
+            }));
+        }
+    }
+    items
+}
+
+/// The workspace's color as resolved by the Spaces row rules, so a group
+/// matches its Space entry.
+fn workspace_color(
+    snapshot: &ClientShellSnapshot,
+    config: &ClientShellConfig,
+    workspace_id: &str,
+    status: crate::api::schema::AgentStatus,
+) -> Option<crate::config::SidebarTokenColor> {
+    let workspace = snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == workspace_id)?;
+    super::sidebar::workspace_rows(snapshot, workspace, status, false, &config.spaces)
+        .into_iter()
+        .flatten()
+        .find(|token| matches!(token.kind, crate::ui::ResolvedTokenKind::Workspace(_)))?
+        .style
+        .fg
+}
+
+fn render_agent_group_row(
+    buffer: &mut Buffer,
+    rect: Rect,
+    group: &AgentGroupRow,
+    snapshot: &ClientShellSnapshot,
+    config: &ClientShellConfig,
+) {
+    let palette = &config.palette;
+    put_text(
+        buffer,
+        rect.x.saturating_add(1),
+        rect.y,
+        rect.width.saturating_sub(1),
+        if group.collapsed { "▸" } else { "▾" },
+        Style::default().fg(palette.accent),
+    );
+    let Some(workspace) = snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == group.workspace_id)
+    else {
+        return;
+    };
+    let tokens =
+        super::sidebar::workspace_rows(snapshot, workspace, group.status, false, &config.spaces)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+    let count = format!(" {}", group.count);
+    let x = rect.x.saturating_add(3);
+    let width = rect.right().saturating_sub(x);
+    let status_style = Style::default().fg(status_color(group.status, palette));
+    let mut spans = crate::ui::resolved_token_spans(
+        &tokens,
+        (
+            status_icon(group.status, config.status_indicators),
+            status_style,
+        ),
+        status_style,
+        Style::default()
+            .fg(palette.subtext0)
+            .add_modifier(Modifier::BOLD),
+        Style::default().fg(palette.overlay0),
+        Style::default().fg(palette.overlay1),
+        palette,
+        (width as usize).saturating_sub(display_width(&count)),
+    );
+    spans.push(Span::styled(count, Style::default().fg(palette.overlay0)));
+    Paragraph::new(Line::from(spans)).render(Rect::new(x, rect.y, width, 1), buffer);
 }
 
 pub(super) fn render_agent_panel_header(
@@ -312,6 +458,8 @@ pub(super) fn agent_row(
     );
     Some(AgentRow {
         pane_id: agent.pane_id.clone(),
+        workspace_id: agent.workspace_id.clone(),
+        group_color: None,
         status: agent.agent_status,
         focused: agent.focused,
         rows,
@@ -323,6 +471,7 @@ pub(super) fn render_agent_row(
     rect: Rect,
     row: &AgentRow,
     config: &ClientShellConfig,
+    nested: u16,
 ) {
     let palette = &config.palette;
     let row_style = if row.focused {
@@ -353,8 +502,18 @@ pub(super) fn render_agent_row(
     } else {
         row.rows.clone()
     };
+    let muted = row
+        .group_color
+        .map(|color| muted_color(color, palette.overlay0));
+    let rows = rows
+        .into_iter()
+        .enumerate()
+        .map(|(index, tokens)| {
+            tinted_tokens(tokens, if index == 0 { row.group_color } else { muted })
+        })
+        .collect::<Vec<_>>();
     for (index, tokens) in rows.iter().take(rect.height as usize).enumerate() {
-        let indent = if index == 0 { 1 } else { 3 };
+        let indent = usize::from(nested) + if index == 0 { 1 } else { 3 };
         let mut spans = vec![ratatui::text::Span::raw(" ".repeat(indent))];
         spans.extend(crate::ui::resolved_token_spans(
             tokens,
@@ -371,6 +530,44 @@ pub(super) fn render_agent_row(
             buffer,
         );
     }
+}
+
+/// Colors a grouped agent's text like its group header, one step weaker (never
+/// bold). Explicit token colors and the state icon keep their own color.
+fn tinted_tokens(
+    tokens: Vec<crate::ui::ResolvedToken>,
+    color: Option<crate::config::SidebarTokenColor>,
+) -> Vec<crate::ui::ResolvedToken> {
+    let Some(color) = color else {
+        return tokens;
+    };
+    tokens
+        .into_iter()
+        .map(|mut token| {
+            if !matches!(token.kind, crate::ui::ResolvedTokenKind::StateIcon) {
+                token.style.fg.get_or_insert(color);
+                token.style.bold.get_or_insert(false);
+            }
+            token
+        })
+        .collect()
+}
+
+/// Mutes by blending toward the muted-text color instead of terminal faint,
+/// which the sidebar avoids so muted rows render the same on every terminal.
+fn muted_color(
+    color: crate::config::SidebarTokenColor,
+    toward: ratatui::style::Color,
+) -> crate::config::SidebarTokenColor {
+    let ratatui::style::Color::Rgb(r, g, b) = color.ratatui() else {
+        return color;
+    };
+    let (tr, tg, tb) = match toward {
+        ratatui::style::Color::Rgb(r, g, b) => (r, g, b),
+        _ => (128, 128, 128),
+    };
+    let mix = |a: u8, b: u8| ((u16::from(a) + u16::from(b)) / 2) as u8;
+    crate::config::SidebarTokenColor::rgb(mix(r, tr), mix(g, tg), mix(b, tb))
 }
 
 fn put_text(buffer: &mut Buffer, x: u16, y: u16, width: u16, text: &str, style: Style) {

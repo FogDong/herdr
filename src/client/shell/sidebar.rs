@@ -244,6 +244,7 @@ pub(crate) fn render_sidebar(
                 .get(entry.index)
                 .map(|workspace| {
                     workspace_rows(
+                        snapshot,
                         workspace,
                         displayed_workspace_status(snapshot, workspace, state.collapsed_groups),
                         entry.indented,
@@ -304,7 +305,7 @@ pub(crate) fn render_sidebar(
             continue;
         };
         let status = displayed_workspace_status(snapshot, workspace, state.collapsed_groups);
-        let rows = workspace_rows(workspace, status, entry.indented, &config.spaces);
+        let rows = workspace_rows(snapshot, workspace, status, entry.indented, &config.spaces);
         let row_height = (rows.len().max(1).min(u16::MAX as usize) as u16).min(body.height);
         if y.saturating_add(row_height) > body.bottom() {
             break;
@@ -435,6 +436,7 @@ pub(crate) fn render_sidebar(
         detail_area,
         snapshot,
         config,
+        state.collapsed_agent_groups,
         state.agent_scroll,
         hits,
     );
@@ -661,6 +663,7 @@ pub(in crate::client::shell) fn displayed_workspace_status(
 }
 
 pub(in crate::client::shell) fn workspace_rows(
+    snapshot: &ClientShellSnapshot,
     workspace: &ClientShellWorkspace,
     status: crate::api::schema::AgentStatus,
     indented: bool,
@@ -676,7 +679,7 @@ pub(in crate::client::shell) fn workspace_rows(
         &workspace.label
     };
     let token_values = workspace.tokens.iter().cloned().collect::<HashMap<_, _>>();
-    crate::ui::sidebar_space_rows(
+    let mut rows = crate::ui::sidebar_space_rows(
         config,
         crate::ui::SpaceTokenContext {
             workspace: label,
@@ -686,7 +689,59 @@ pub(in crate::client::shell) fn workspace_rows(
             tokens: &token_values,
             suppress_git_details: indented,
         },
-    )
+    );
+    for token in rows.iter_mut().flatten() {
+        if matches!(token.kind, crate::ui::ResolvedTokenKind::Workspace(_)) {
+            token
+                .style
+                .fg
+                .get_or_insert(workspace_auto_color(snapshot, &workspace.workspace_id));
+        }
+    }
+    rows
+}
+
+/// Pastels kept off the red status hue, so a workspace name never reads as
+/// an error.
+const WORKSPACE_COLORS: [crate::config::SidebarTokenColor; 8] = [
+    crate::config::SidebarTokenColor::rgb(0xcb, 0xa6, 0xf7),
+    crate::config::SidebarTokenColor::rgb(0xfa, 0xb3, 0x87),
+    crate::config::SidebarTokenColor::rgb(0x89, 0xdc, 0xeb),
+    crate::config::SidebarTokenColor::rgb(0xd7, 0x87, 0xd7),
+    crate::config::SidebarTokenColor::rgb(0x89, 0xb4, 0xfa),
+    crate::config::SidebarTokenColor::rgb(0xb4, 0xbe, 0xfe),
+    crate::config::SidebarTokenColor::rgb(0xc3, 0xe8, 0x8d),
+    crate::config::SidebarTokenColor::rgb(0x9f, 0xe2, 0xbf),
+];
+
+/// Starts from a hash of the label, not the id, so a workspace keeps its color
+/// across server restarts; a color an earlier workspace already took moves on
+/// to the next free one, so up to eight workspaces never share a color.
+fn workspace_auto_color(
+    snapshot: &ClientShellSnapshot,
+    workspace_id: &str,
+) -> crate::config::SidebarTokenColor {
+    let count = WORKSPACE_COLORS.len();
+    let mut taken = vec![false; count];
+    let mut pick = 0;
+    for workspace in &snapshot.workspaces {
+        let start = workspace
+            .label
+            .bytes()
+            .fold(0xcbf29ce484222325u64, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+            }) as usize
+            % count;
+        pick = (0..count)
+            .map(|step| (start + step) % count)
+            .find(|index| !taken[*index])
+            .unwrap_or(start);
+        if workspace.workspace_id == workspace_id {
+            break;
+        }
+        taken[pick] = true;
+    }
+    WORKSPACE_COLORS[pick]
 }
 
 pub(in crate::client::shell) fn render_workspace_rows(
